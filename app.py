@@ -36,7 +36,7 @@ def eleven_realtime_stt_url() -> str:
         "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
         "?model_id=scribe_v2_realtime"
         "&language_code=en"
-        "&audio_format=mulaw_8000"
+        "&audio_format=ulaw_8000"
         "&commit_strategy=vad"
     )
 
@@ -46,52 +46,47 @@ def eleven_realtime_stt_url() -> str:
 async def ws_twilio(ws: WebSocket):
     await ws.accept()
 
+    url = eleven_realtime_stt_url()
+    print("Eleven WS URL:", url)
+
     try:
         async with websockets.connect(
-            eleven_realtime_stt_url(),
-            extra_headers=[("xi-api-key", ELEVEN_API_KEY)],
+            url,
+            additional_headers=[("xi-api-key", ELEVEN_API_KEY)],
         ) as eleven_ws:
+            print("Connected to ElevenLabs")
+
+            # Try a start/init message
+            await eleven_ws.send(json.dumps({"message_type": "start"}))
 
             async def forward_twilio_audio_to_eleven():
-                """Read Twilio WS events; forward media payloads to ElevenLabs STT."""
                 while True:
                     raw = await ws.receive_text()
                     msg = json.loads(raw)
 
                     if msg.get("event") == "media":
-                        # Twilio payload is base64 audio
-                        audio_b64 = msg["media"]["payload"]
                         await eleven_ws.send(json.dumps({
                             "message_type": "input_audio_chunk",
-                            "audio_base_64": audio_b64,
+                            "audio_base_64": msg["media"]["payload"],
                         }))
 
                     if msg.get("event") == "stop":
                         break
 
             async def read_eleven_transcripts():
-                """Print transcripts from ElevenLabs."""
-                while True:
-                    raw = await eleven_ws.recv()
-                    msg = json.loads(raw)
+                try:
+                    # Print first message from server (often contains config/error)
+                    first = await eleven_ws.recv()
+                    print("Eleven first msg:", first)
 
-                    mtype = msg.get("message_type")
+                    while True:
+                        raw = await eleven_ws.recv()
+                        msg = json.loads(raw)
+                        print("Eleven msg:", msg)
+                except websockets.ConnectionClosed as e:
+                    print("Eleven WS closed:", e.code, e.reason)
 
-                    if mtype == "partial_transcript":
-                        # uncomment if you want live partials
-                        # print("partial:", msg.get("text", ""))
-                        pass
-
-                    if mtype == "committed_transcript":
-                        print("YOU SAID:", msg.get("text", ""))
-
-                    if mtype in ("input_error", "transcriber_error", "auth_error", "error"):
-                        print("ElevenLabs error:", msg)
-
-            await asyncio.gather(
-                forward_twilio_audio_to_eleven(),
-                read_eleven_transcripts(),
-            )
+            await asyncio.gather(forward_twilio_audio_to_eleven(), read_eleven_transcripts())
 
     except WebSocketDisconnect:
-        return
+        print("Twilio websocket disconnected")
