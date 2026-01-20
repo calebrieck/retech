@@ -1,10 +1,14 @@
 import os
 import json
 import asyncio
+import base64
+import urllib.request
+import urllib.error
+import uuid
 from typing import Set
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
@@ -13,15 +17,22 @@ import websockets
 load_dotenv()
 
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
+print(PUBLIC_BASE_URL)
 app = FastAPI()
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 
 CLIENTS: Set[WebSocket] = set()
 CLIENTS_LOCK = asyncio.Lock()
+LAST_CALL_SID: str | None = None
+CALL_SID_LOCK = asyncio.Lock()
+AUDIO_CACHE: dict[str, bytes] = {}
+AUDIO_CACHE_LOCK = asyncio.Lock()
 
 
 async def broadcast(payload: dict) -> None:
@@ -46,6 +57,58 @@ async def broadcast(payload: dict) -> None:
                 CLIENTS.discard(d)
 
 
+async def set_last_call_sid(call_sid: str | None) -> None:
+    global LAST_CALL_SID
+    async with CALL_SID_LOCK:
+        LAST_CALL_SID = call_sid
+
+
+async def get_last_call_sid() -> str | None:
+    async with CALL_SID_LOCK:
+        return LAST_CALL_SID
+
+
+def eleven_tts_url() -> str:
+    return f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
+
+
+def synthesize_elevenlabs_audio(text: str) -> bytes:
+    if not ELEVEN_API_KEY:
+        raise RuntimeError("Missing ELEVENLABS_API_KEY")
+
+    payload = json.dumps({
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        eleven_tts_url(),
+        data=payload,
+        headers={
+            "xi-api-key": ELEVEN_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read()
+
+
+async def cache_audio_bytes(audio_bytes: bytes) -> str:
+    audio_id = uuid.uuid4().hex
+    async with AUDIO_CACHE_LOCK:
+        AUDIO_CACHE[audio_id] = audio_bytes
+    return audio_id
+
+
+async def pop_audio_bytes(audio_id: str) -> bytes | None:
+    async with AUDIO_CACHE_LOCK:
+        return AUDIO_CACHE.pop(audio_id, None)
+
+
 @app.websocket("/ws/client")
 async def ws_client(ws: WebSocket):
     """
@@ -66,6 +129,64 @@ async def ws_client(ws: WebSocket):
             CLIENTS.discard(ws)
 
 
+@app.post("/chatgpt-response")
+async def chatgpt_response(request: Request):
+    payload = await request.json()
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="Missing or empty text field")
+
+    metadata = payload.get("metadata") or {}
+
+    await broadcast({
+        "source": "chatgpt",
+        "event": "response",
+        "text": text,
+        "metadata": metadata,
+    })
+
+    try:
+        audio_bytes = await asyncio.to_thread(synthesize_elevenlabs_audio, text)
+        audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+        audio_id = await cache_audio_bytes(audio_bytes)
+        await broadcast({
+            "source": "eleven",
+            "event": "tts",
+            "text": text,
+            "metadata": metadata,
+            "audio_base64": audio_base64,
+            "audio_id": audio_id,
+        })
+        call_sid = await get_last_call_sid()
+        if call_sid and PUBLIC_BASE_URL:
+            twiml = VoiceResponse()
+            twiml.play(f"{PUBLIC_BASE_URL}/tts/{audio_id}")
+            twiml.redirect(f"{PUBLIC_BASE_URL}/voice", method="POST")
+
+            await asyncio.to_thread(
+                twilio_client.calls(call_sid).update,
+                twiml=str(twiml),
+            )
+
+        else:
+            if not call_sid:
+                print("No active call SID available for playback.")
+            if not PUBLIC_BASE_URL:
+                print("PUBLIC_BASE_URL not set; cannot play audio to phone.")
+    except Exception as exc:
+        print("ElevenLabs TTS failed:", repr(exc))
+
+    return {"status": "ok"}
+
+
+@app.get("/tts/{audio_id}")
+async def get_tts_audio(audio_id: str):
+    audio_bytes = await pop_audio_bytes(audio_id)
+    if audio_bytes is None:
+        return Response(status_code=404)
+    return Response(audio_bytes, media_type="audio/mpeg")
+
+
 # ----------------------------
 # Outbound call trigger
 # ----------------------------
@@ -74,7 +195,7 @@ async def call_me():
     call = twilio_client.calls.create(
         to="+14046443252",
         from_="+18886444317",
-        url="https://tereasa-unscabbed-leonard.ngrok-free.dev/voice",
+        url=f"{PUBLIC_BASE_URL}/voice",
     )
     print("Outbound call initiated. SID:", call.sid)
     return {"status": "calling", "sid": call.sid}
@@ -172,6 +293,7 @@ async def ws_twilio(ws: WebSocket):
                         call_sid = start.get("callSid")
                         stream_sid = start.get("streamSid")
                         print("Twilio start:", {"callSid": call_sid, "streamSid": stream_sid})
+                        await set_last_call_sid(call_sid)
                         await broadcast({
                             "source": "twilio",
                             "event": "start",
@@ -187,6 +309,7 @@ async def ws_twilio(ws: WebSocket):
 
                     elif event == "stop":
                         print("Twilio stop received")
+                        await set_last_call_sid(None)
                         await broadcast({
                             "source": "twilio",
                             "event": "stop",
