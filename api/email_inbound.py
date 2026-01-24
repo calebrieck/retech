@@ -1,16 +1,20 @@
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Request
 from uuid import uuid4
-from firebase_admin import firestore
-from app.firebase import db
-from app.ai import run_ai_agent
-from app.email import send_email
-from app.storage import upload_image
+
+from api.ai import run_ai_agent
+from api.email import send_email
+from api.storage import upload_image
+from api.supabase.ticket_helpers import (
+    append_ticket_message_id,
+    create_ticket,
+    create_ticket_message,
+    find_ticket_by_message_id,
+    update_ticket_classification,
+)
 import traceback
-from email import message_from_bytes
-from email.policy import default
 import io
 
-app = FastAPI()
+router = APIRouter()
 
 def extract_header(headers: str, key: str):
     if not headers:
@@ -110,7 +114,7 @@ def parse_sendgrid_webhook(body: bytes, content_type: str):
     result['_attachments'] = attachments
     return result
 
-@app.post("/email/inbound")
+@router.post("/email/inbound")
 async def inbound_email(request: Request):
     try:
         body = await request.body()
@@ -146,37 +150,20 @@ async def inbound_email(request: Request):
         message_id = extract_header(headers, "Message-ID")
         in_reply_to = extract_header(headers, "In-Reply-To")
 
-        ticket_ref = None
+        ticket = None
 
         if in_reply_to:
-            matches = (
-                db.collection("tickets")
-                .where("messageIds", "array_contains", in_reply_to)
-                .limit(1)
-                .stream()
-            )
-            for doc in matches:
-                ticket_ref = doc.reference
+            ticket = find_ticket_by_message_id(in_reply_to)
 
-        if not ticket_ref:
-            ticket_ref = db.collection("tickets").document(str(uuid4()))
-            ticket_ref.set({
-                "tenantEmail": tenant_email,
-                "subject": subject,
-                "status": "open",
-                "issueCategory": "unknown",
-                "severity": "unknown",
-                "messageIds": [],
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
+        if not ticket:
+            ticket = create_ticket(tenant_email, subject)
 
         tenant_msg_id = message_id or str(uuid4())
         
         image_data = []
         image_urls = []
         if attachments:
-            ticket_id = ticket_ref.id
+            ticket_id = ticket["id"]
             for att in attachments:
                 try:
                     result = upload_image(
@@ -192,21 +179,16 @@ async def inbound_email(request: Request):
                     print(f"Failed to upload image: {e}")
                     print(traceback.format_exc())
         
-        message_data = {
-            "sender": "tenant",
-            "content": body_text,
-            "createdAt": firestore.SERVER_TIMESTAMP
-        }
-        if image_urls:
-            message_data["images"] = image_urls
-        
-        ticket_ref.collection("messages").document(tenant_msg_id).set(message_data)
+        create_ticket_message(
+            ticket_id=ticket["id"],
+            message_id=tenant_msg_id,
+            sender="tenant",
+            content=body_text,
+            images=image_urls or None,
+        )
 
         if message_id:
-            ticket_ref.update({
-                "messageIds": firestore.ArrayUnion([message_id]),
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
+            append_ticket_message_id(ticket["id"], message_id)
 
         ai_result = run_ai_agent(subject, body_text, image_data)
 
@@ -218,18 +200,20 @@ async def inbound_email(request: Request):
             references=in_reply_to or message_id
         )
 
-        ticket_ref.collection("messages").document(ai_message_id).set({
-            "sender": "ai",
-            "content": ai_result["reply"],
-            "createdAt": firestore.SERVER_TIMESTAMP
-        })
+        create_ticket_message(
+            ticket_id=ticket["id"],
+            message_id=ai_message_id,
+            sender="ai",
+            content=ai_result["reply"],
+        )
 
-        ticket_ref.update({
-            "messageIds": firestore.ArrayUnion([ai_message_id]),
-            "issueCategory": ai_result["issue_category"],
-            "severity": ai_result["severity"],
-            "updatedAt": firestore.SERVER_TIMESTAMP
-        })
+        append_ticket_message_id(ticket["id"], ai_message_id)
+        update_ticket_classification(
+            ticket["id"],
+            issue_category=ai_result["issue_category"],
+            severity=ai_result["severity"],
+            message_id=ai_message_id,
+        )
 
         return {"status": "ok"}
     
