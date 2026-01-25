@@ -1,20 +1,35 @@
+import os
 from fastapi import APIRouter, Request
 from uuid import uuid4
 
 from api.ai import run_ai_agent
 from api.email import send_email
 from api.storage import upload_image
-from api.supabase.ticket_helpers import (
-    append_ticket_message_id,
-    create_ticket,
-    create_ticket_message,
-    find_ticket_by_message_id,
-    update_ticket_classification,
+from api.supabase.db_helpers import (
+    create_conversation,
+    create_message,
+    create_work_order,
+    find_message_by_external_id,
+    update_work_order,
 )
 import traceback
 import io
 
 router = APIRouter()
+
+DEFAULT_TENANT_ID_ENV = "DEFAULT_TENANT_ID"
+DEFAULT_PROPERTY_ID_ENV = "DEFAULT_PROPERTY_ID"
+
+
+def get_default_work_order_context() -> tuple[str, str]:
+    tenant_id = os.getenv(DEFAULT_TENANT_ID_ENV)
+    property_id = os.getenv(DEFAULT_PROPERTY_ID_ENV)
+    if not tenant_id or not property_id:
+        raise RuntimeError(
+            "Missing default work order context. Set "
+            f"{DEFAULT_TENANT_ID_ENV} and {DEFAULT_PROPERTY_ID_ENV}."
+        )
+    return tenant_id, property_id
 
 def extract_header(headers: str, key: str):
     if not headers:
@@ -150,27 +165,38 @@ async def inbound_email(request: Request):
         message_id = extract_header(headers, "Message-ID")
         in_reply_to = extract_header(headers, "In-Reply-To")
 
-        ticket = None
-
+        existing_message = None
         if in_reply_to:
-            ticket = find_ticket_by_message_id(in_reply_to)
+            existing_message = find_message_by_external_id(in_reply_to)
 
-        if not ticket:
-            ticket = create_ticket(tenant_email, subject)
+        if existing_message:
+            work_order_id = existing_message["work_order_id"]
+            conversation_id = existing_message["conversation_id"]
+        else:
+            tenant_id, property_id = get_default_work_order_context()
+            work_order = create_work_order(
+                tenant_id,
+                property_id,
+                title=subject,
+                description=body_text,
+                status="new",
+            )
+            conversation = create_conversation(work_order["id"], party_type="tenant")
+            work_order_id = work_order["id"]
+            conversation_id = conversation["id"]
 
         tenant_msg_id = message_id or str(uuid4())
         
         image_data = []
         image_urls = []
         if attachments:
-            ticket_id = ticket["id"]
             for att in attachments:
                 try:
                     result = upload_image(
                         file_data=att["data"],
                         filename=att["filename"],
                         content_type=att["content_type"],
-                        ticket_id=ticket_id
+                        work_order_id=work_order_id,
                     )
                     image_data.append(result)
                     image_urls.append(result['url'])
@@ -179,16 +205,20 @@ async def inbound_email(request: Request):
                     print(f"Failed to upload image: {e}")
                     print(traceback.format_exc())
         
-        create_ticket_message(
-            ticket_id=ticket["id"],
-            message_id=tenant_msg_id,
-            sender="tenant",
-            content=body_text,
-            images=image_urls or None,
+        create_message(
+            conversation_id,
+            work_order_id,
+            direction="inbound",
+            channel="email",
+            body=body_text,
+            raw_payload={
+                "external_message_id": tenant_msg_id,
+                "from": tenant_email,
+                "subject": subject,
+                "in_reply_to": in_reply_to,
+                "image_urls": image_urls,
+            },
         )
-
-        if message_id:
-            append_ticket_message_id(ticket["id"], message_id)
 
         ai_result = run_ai_agent(subject, body_text, image_data)
 
@@ -200,20 +230,24 @@ async def inbound_email(request: Request):
             references=in_reply_to or message_id
         )
 
-        create_ticket_message(
-            ticket_id=ticket["id"],
-            message_id=ai_message_id,
-            sender="ai",
-            content=ai_result["reply"],
+        create_message(
+            conversation_id,
+            work_order_id,
+            direction="outbound",
+            channel="email",
+            body=ai_result["reply"],
+            raw_payload={
+                "external_message_id": ai_message_id,
+                "in_reply_to": message_id,
+                "references": in_reply_to or message_id,
+                "issue_category": ai_result["issue_category"],
+                "severity": ai_result["severity"],
+            },
         )
 
-        append_ticket_message_id(ticket["id"], ai_message_id)
-        update_ticket_classification(
-            ticket["id"],
-            issue_category=ai_result["issue_category"],
-            severity=ai_result["severity"],
-            message_id=ai_message_id,
-        )
+        priority = ai_result.get("severity")
+        if priority:
+            update_work_order(work_order_id, priority=priority)
 
         return {"status": "ok"}
     

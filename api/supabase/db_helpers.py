@@ -141,6 +141,28 @@ def get_work_order(work_order_id: str) -> dict | None:
     return _maybe_single(response)
 
 
+def update_work_order(
+    work_order_id: str,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+) -> dict:
+    payload = {
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "status": status,
+    }
+    updates = {key: value for key, value in payload.items() if value is not None}
+    if not updates:
+        return get_work_order(work_order_id) or {}
+    sb = get_supabase()
+    response = sb.table("work_orders").update(updates).eq("id", work_order_id).execute()
+    return _expect_single(response, context="update_work_order")
+
+
 def list_work_orders(tenant_id: str) -> list[dict]:
     sb = get_supabase()
     response = (
@@ -218,6 +240,17 @@ def list_messages_for_conversation(conversation_id: str) -> list[dict]:
     )
     return response.data or []
 
+def find_message_by_external_id(external_message_id: str) -> dict | None:
+    sb = get_supabase()
+    response = (
+        sb.table("messages")
+        .select("*")
+        .contains("raw_payload", {"external_message_id": external_message_id})
+        .limit(1)
+        .execute()
+    )
+    return _maybe_single(response)
+
 
 def list_messages_for_work_order(work_order_id: str) -> list[dict]:
     sb = get_supabase()
@@ -225,6 +258,62 @@ def list_messages_for_work_order(work_order_id: str) -> list[dict]:
         sb.table("messages")
         .select("*")
         .eq("work_order_id", work_order_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return response.data or []
+
+
+def create_media_asset(
+    work_order_id: str,
+    *,
+    storage_path: str,
+    message_id: str | None = None,
+    uploaded_by_user_id: str | None = None,
+    media_type: str = "image",
+    file_name: str | None = None,
+    content_type: str | None = None,
+    byte_size: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    public_url: str | None = None,
+) -> dict:
+    sb = get_supabase()
+    payload = {
+        "work_order_id": work_order_id,
+        "message_id": message_id,
+        "uploaded_by_user_id": uploaded_by_user_id,
+        "media_type": media_type,
+        "file_name": file_name,
+        "content_type": content_type,
+        "byte_size": byte_size,
+        "width": width,
+        "height": height,
+        "storage_path": storage_path,
+        "public_url": public_url,
+    }
+    response = sb.table("media_assets").insert(payload).execute()
+    return _expect_single(response, context="create_media_asset")
+
+
+def list_media_assets_for_work_order(work_order_id: str) -> list[dict]:
+    sb = get_supabase()
+    response = (
+        sb.table("media_assets")
+        .select("*")
+        .eq("work_order_id", work_order_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return response.data or []
+
+
+def list_media_assets_for_message(message_id: str) -> list[dict]:
+    sb = get_supabase()
+    response = (
+        sb.table("media_assets")
+        .select("*")
+        .eq("message_id", message_id)
         .order("created_at", desc=False)
         .execute()
     )

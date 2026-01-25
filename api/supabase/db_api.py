@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from api.supabase.db_helpers import (
     create_conversation,
     create_message,
+    create_media_asset,
     create_property,
     create_tenant,
     create_unit,
@@ -14,6 +15,8 @@ from api.supabase.db_helpers import (
     get_tenant,
     get_work_order,
     list_conversations,
+    list_media_assets_for_message,
+    list_media_assets_for_work_order,
     list_messages_for_conversation,
     list_messages_for_work_order,
     list_properties,
@@ -66,6 +69,19 @@ class MessageCreate(BaseModel):
     recipient_user_id: str | None = None
     body: str | None = None
     raw_payload: dict | None = None
+
+
+class MediaAssetCreate(BaseModel):
+    message_id: str | None = None
+    uploaded_by_user_id: str | None = None
+    media_type: str | None = None
+    file_name: str | None = None
+    content_type: str | None = None
+    byte_size: int | None = None
+    width: int | None = None
+    height: int | None = None
+    storage_path: str
+    public_url: str | None = None
 
 
 @router.post("/tenants")
@@ -179,3 +195,30 @@ async def list_messages_for_conversation_endpoint(conversation_id: str):
 @router.get("/work-orders/{work_order_id}/messages")
 async def list_messages_for_work_order_endpoint(work_order_id: str):
     return list_messages_for_work_order(work_order_id)
+
+
+@router.post("/work-orders/{work_order_id}/media-assets")
+async def create_media_asset_endpoint(work_order_id: str, payload: MediaAssetCreate):
+    return create_media_asset(
+        work_order_id,
+        message_id=payload.message_id,
+        uploaded_by_user_id=payload.uploaded_by_user_id,
+        media_type=payload.media_type or "image",
+        file_name=payload.file_name,
+        content_type=payload.content_type,
+        byte_size=payload.byte_size,
+        width=payload.width,
+        height=payload.height,
+        storage_path=payload.storage_path,
+        public_url=payload.public_url,
+    )
+
+
+@router.get("/work-orders/{work_order_id}/media-assets")
+async def list_media_assets_for_work_order_endpoint(work_order_id: str):
+    return list_media_assets_for_work_order(work_order_id)
+
+
+@router.get("/messages/{message_id}/media-assets")
+async def list_media_assets_for_message_endpoint(message_id: str):
+    return list_media_assets_for_message(message_id)
