@@ -1,16 +1,25 @@
-from fastapi import FastAPI, Request
+from email.utils import parseaddr
+import os
+from fastapi import APIRouter, HTTPException, Request
 from uuid import uuid4
-from firebase_admin import firestore
-from app.firebase import db
-from app.ai import run_ai_agent
-from app.email import send_email
-from app.storage import upload_image
+
+from api.ai import run_ai_agent
+from api.email import send_email
+from api.storage import upload_image
+from api.supabase.db_helpers import (
+    create_conversation,
+    create_message,
+    create_work_order,
+    find_message_by_external_id,
+    get_default_property_for_tenant,
+    get_user_by_email,
+    update_work_order,
+)
 import traceback
-from email import message_from_bytes
-from email.policy import default
 import io
 
-app = FastAPI()
+router = APIRouter()
+
 
 def extract_header(headers: str, key: str):
     if not headers:
@@ -110,7 +119,8 @@ def parse_sendgrid_webhook(body: bytes, content_type: str):
     result['_attachments'] = attachments
     return result
 
-@app.post("/email/inbound")
+
+@router.post("/email/inbound")
 async def inbound_email(request: Request):
     try:
         body = await request.body()
@@ -123,14 +133,22 @@ async def inbound_email(request: Request):
         form_data = parse_sendgrid_webhook(body, content_type)
         
         tenant_email = form_data.get("from")
+        _, tenant_email = parseaddr(tenant_email or "")
+        tenant_email = (tenant_email or "").strip().lower()
+        
         subject = form_data.get("subject") or "(No subject)"
         body_text = form_data.get("text") or ""
         headers = form_data.get("headers") or ""
-        
+
         print(f"From: {tenant_email}")
         print(f"Subject: {subject}")
         print(f"Body length: {len(body_text)}")
-        
+
+        user = get_user_by_email(tenant_email) if tenant_email else None
+        if not user:
+            print(f"No user found for inbound email: {tenant_email}")
+            raise HTTPException(status_code=403, detail="User not authorized")
+
         attachments = []
         for att in form_data.get('_attachments', []):
             if att['content_type'] and att['content_type'].startswith("image/"):
@@ -146,44 +164,43 @@ async def inbound_email(request: Request):
         message_id = extract_header(headers, "Message-ID")
         in_reply_to = extract_header(headers, "In-Reply-To")
 
-        ticket_ref = None
-
+        existing_message = None
         if in_reply_to:
-            matches = (
-                db.collection("tickets")
-                .where("messageIds", "array_contains", in_reply_to)
-                .limit(1)
-                .stream()
-            )
-            for doc in matches:
-                ticket_ref = doc.reference
+            existing_message = find_message_by_external_id(in_reply_to)
 
-        if not ticket_ref:
-            ticket_ref = db.collection("tickets").document(str(uuid4()))
-            ticket_ref.set({
-                "tenantEmail": tenant_email,
-                "subject": subject,
-                "status": "open",
-                "issueCategory": "unknown",
-                "severity": "unknown",
-                "messageIds": [],
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
+        if existing_message:
+            work_order_id = existing_message["work_order_id"]
+            conversation_id = existing_message["conversation_id"]
+        else:
+            tenant_id = user["tenant_id"]
+            property_record = get_default_property_for_tenant(tenant_id)
+            if not property_record:
+                raise HTTPException(status_code=400, detail="No property configured for tenant")
+            property_id = property_record["id"]
+            work_order = create_work_order(
+                tenant_id,
+                property_id,
+                reported_by_user_id=user["id"],
+                title=subject,
+                description=body_text,
+                status="new",
+            )
+            conversation = create_conversation(work_order["id"], party_type="tenant")
+            work_order_id = work_order["id"]
+            conversation_id = conversation["id"]
 
         tenant_msg_id = message_id or str(uuid4())
         
         image_data = []
         image_urls = []
         if attachments:
-            ticket_id = ticket_ref.id
             for att in attachments:
                 try:
                     result = upload_image(
                         file_data=att["data"],
                         filename=att["filename"],
                         content_type=att["content_type"],
-                        ticket_id=ticket_id
+                        work_order_id=work_order_id,
                     )
                     image_data.append(result)
                     image_urls.append(result['url'])
@@ -192,21 +209,20 @@ async def inbound_email(request: Request):
                     print(f"Failed to upload image: {e}")
                     print(traceback.format_exc())
         
-        message_data = {
-            "sender": "tenant",
-            "content": body_text,
-            "createdAt": firestore.SERVER_TIMESTAMP
-        }
-        if image_urls:
-            message_data["images"] = image_urls
-        
-        ticket_ref.collection("messages").document(tenant_msg_id).set(message_data)
-
-        if message_id:
-            ticket_ref.update({
-                "messageIds": firestore.ArrayUnion([message_id]),
-                "updatedAt": firestore.SERVER_TIMESTAMP
-            })
+        create_message(
+            conversation_id,
+            work_order_id,
+            direction="inbound",
+            channel="email",
+            body=body_text,
+            raw_payload={
+                "external_message_id": tenant_msg_id,
+                "from": tenant_email,
+                "subject": subject,
+                "in_reply_to": in_reply_to,
+                "image_urls": image_urls,
+            },
+        )
 
         ai_result = run_ai_agent(subject, body_text, image_data)
 
@@ -218,21 +234,29 @@ async def inbound_email(request: Request):
             references=in_reply_to or message_id
         )
 
-        ticket_ref.collection("messages").document(ai_message_id).set({
-            "sender": "ai",
-            "content": ai_result["reply"],
-            "createdAt": firestore.SERVER_TIMESTAMP
-        })
+        create_message(
+            conversation_id,
+            work_order_id,
+            direction="outbound",
+            channel="email",
+            body=ai_result["reply"],
+            raw_payload={
+                "external_message_id": ai_message_id,
+                "in_reply_to": message_id,
+                "references": in_reply_to or message_id,
+                "issue_category": ai_result["issue_category"],
+                "severity": ai_result["severity"],
+            },
+        )
 
-        ticket_ref.update({
-            "messageIds": firestore.ArrayUnion([ai_message_id]),
-            "issueCategory": ai_result["issue_category"],
-            "severity": ai_result["severity"],
-            "updatedAt": firestore.SERVER_TIMESTAMP
-        })
+        priority = ai_result.get("severity")
+        if priority:
+            update_work_order(work_order_id, priority=priority)
 
         return {"status": "ok"}
     
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"ERROR: {str(e)}")
         print(traceback.format_exc())

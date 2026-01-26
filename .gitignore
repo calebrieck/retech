@@ -1,6 +1,55 @@
 serviceAccount.json
-.env
 venv/
+
+# =========================
+# Python
+# =========================
 __pycache__/
-.DS_Store
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# Virtual environments
+# =========================
+my_project_venv/
+.venv/
+env/
+ENV/
+.virtualenv/
+
+# =========================
+# Environment variables / secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# IDEs / Editors
+# =========================
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS junk
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Build / distribution
+# =========================
+build/
+dist/
+*.egg-info/

@@ -1,9 +1,9 @@
 fastapi
 uvicorn
 python-multipart
-firebase-admin
 sendgrid
 python-dotenv
 openai
 twilio 
 httpx
+supabase
