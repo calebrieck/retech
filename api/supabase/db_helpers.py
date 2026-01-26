@@ -65,6 +65,34 @@ def list_users(tenant_id: str) -> list[dict]:
     return response.data or []
 
 
+def get_user_by_email(email: str) -> dict | None:
+    sb = get_supabase()
+    #debug
+    allusers = sb.table("users").select("*").execute()
+    print(f"All users in DB: {allusers.data}")
+    response = (
+        sb.table("users")
+        .select("*")
+        .ilike("email", email)
+        .limit(1)
+        .execute()
+    )
+    return _maybe_single(response)
+
+
+def get_default_property_for_tenant(tenant_id: str) -> dict | None:
+    sb = get_supabase()
+    response = (
+        sb.table("properties")
+        .select("*")
+        .eq("tenant_id", tenant_id)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    return _maybe_single(response)
+
+
 def create_property(tenant_id: str, *, address: str | None = None) -> dict:
     sb = get_supabase()
     response = (

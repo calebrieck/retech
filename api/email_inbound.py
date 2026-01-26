@@ -1,5 +1,6 @@
+from email.utils import parseaddr
 import os
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from uuid import uuid4
 
 from api.ai import run_ai_agent
@@ -10,6 +11,8 @@ from api.supabase.db_helpers import (
     create_message,
     create_work_order,
     find_message_by_external_id,
+    get_default_property_for_tenant,
+    get_user_by_email,
     update_work_order,
 )
 import traceback
@@ -17,19 +20,6 @@ import io
 
 router = APIRouter()
 
-DEFAULT_TENANT_ID_ENV = "DEFAULT_TENANT_ID"
-DEFAULT_PROPERTY_ID_ENV = "DEFAULT_PROPERTY_ID"
-
-
-def get_default_work_order_context() -> tuple[str, str]:
-    tenant_id = os.getenv(DEFAULT_TENANT_ID_ENV)
-    property_id = os.getenv(DEFAULT_PROPERTY_ID_ENV)
-    if not tenant_id or not property_id:
-        raise RuntimeError(
-            "Missing default work order context. Set "
-            f"{DEFAULT_TENANT_ID_ENV} and {DEFAULT_PROPERTY_ID_ENV}."
-        )
-    return tenant_id, property_id
 
 def extract_header(headers: str, key: str):
     if not headers:
@@ -129,6 +119,7 @@ def parse_sendgrid_webhook(body: bytes, content_type: str):
     result['_attachments'] = attachments
     return result
 
+
 @router.post("/email/inbound")
 async def inbound_email(request: Request):
     try:
@@ -142,14 +133,22 @@ async def inbound_email(request: Request):
         form_data = parse_sendgrid_webhook(body, content_type)
         
         tenant_email = form_data.get("from")
+        _, tenant_email = parseaddr(tenant_email or "")
+        tenant_email = (tenant_email or "").strip().lower()
+        
         subject = form_data.get("subject") or "(No subject)"
         body_text = form_data.get("text") or ""
         headers = form_data.get("headers") or ""
-        
+
         print(f"From: {tenant_email}")
         print(f"Subject: {subject}")
         print(f"Body length: {len(body_text)}")
-        
+
+        user = get_user_by_email(tenant_email) if tenant_email else None
+        if not user:
+            print(f"No user found for inbound email: {tenant_email}")
+            raise HTTPException(status_code=403, detail="User not authorized")
+
         attachments = []
         for att in form_data.get('_attachments', []):
             if att['content_type'] and att['content_type'].startswith("image/"):
@@ -173,10 +172,15 @@ async def inbound_email(request: Request):
             work_order_id = existing_message["work_order_id"]
             conversation_id = existing_message["conversation_id"]
         else:
-            tenant_id, property_id = get_default_work_order_context()
+            tenant_id = user["tenant_id"]
+            property_record = get_default_property_for_tenant(tenant_id)
+            if not property_record:
+                raise HTTPException(status_code=400, detail="No property configured for tenant")
+            property_id = property_record["id"]
             work_order = create_work_order(
                 tenant_id,
                 property_id,
+                reported_by_user_id=user["id"],
                 title=subject,
                 description=body_text,
                 status="new",
@@ -251,6 +255,8 @@ async def inbound_email(request: Request):
 
         return {"status": "ok"}
     
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"ERROR: {str(e)}")
         print(traceback.format_exc())
